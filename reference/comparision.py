@@ -34,6 +34,23 @@ def calculate_similarity(landmarks_video, landmarks_webcam):
     score = max(0, 100 - (avg_distance / max_distance) * 100)
     return round(score, 2)
 
+def provide_feedback(landmarks_video, landmarks_webcam):
+    feedback_messages = []
+
+    # 예시로 어깨와 엉덩이 높이 비교 피드백 제공
+    shoulder_video = landmarks_video[mp_pose.PoseLandmark.LEFT_SHOULDER.value]
+    shoulder_webcam = landmarks_webcam[mp_pose.PoseLandmark.LEFT_SHOULDER.value]
+    hip_video = landmarks_video[mp_pose.PoseLandmark.LEFT_HIP.value]
+    hip_webcam = landmarks_webcam[mp_pose.PoseLandmark.LEFT_HIP.value]
+
+    if abs(shoulder_video.y - shoulder_webcam.y) > 0.1:
+        feedback_messages.append("move your shoulder .")
+    
+    if abs(hip_video.y - hip_webcam.y) > 0.1:
+        feedback_messages.append("move your hip")
+    
+    return feedback_messages
+
 while cap_video.isOpened() and cap_webcam.isOpened():
     if not pause_video:
         ret_video, frame_video = cap_video.read()
@@ -74,7 +91,7 @@ while cap_video.isOpened() and cap_webcam.isOpened():
     results_video = pose.process(rgb_frame_video)
     results_webcam = pose.process(rgb_frame_webcam)
 
-    # 유사도 계산
+    # 유사도 계산 및 피드백 제공
     similarity_score = 0
     if results_video.pose_landmarks and results_webcam.pose_landmarks:
         similarity_score = calculate_similarity(results_video.pose_landmarks.landmark, results_webcam.pose_landmarks.landmark)
@@ -83,6 +100,12 @@ while cap_video.isOpened() and cap_webcam.isOpened():
         score_text = f"Similarity Score: {similarity_score}"
         cv2.putText(frame_webcam, score_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
 
+        # 90점 미만일 때 피드백 메시지 출력
+        if similarity_score < 90:
+            feedback_messages = provide_feedback(results_video.pose_landmarks.landmark, results_webcam.pose_landmarks.landmark)
+            for idx, message in enumerate(feedback_messages):
+                cv2.putText(frame_webcam, message, (10, 60 + idx * 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
+        
         # 80점 미만일 때 비디오 일시 정지
         pause_video = similarity_score < 80
 
