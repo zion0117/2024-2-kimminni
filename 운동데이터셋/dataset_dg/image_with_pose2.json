@@ -1,0 +1,20 @@
+{
+    "image": {
+        "file_name": "C:/Users/user/Desktop/24-2/dataset_dg/pose1-2.jpg",
+        "description": "Pose landmarks extracted using MediaPipe.",
+        "tags": [
+            "pose",
+            "mediapipe",
+            "fitness",
+            "joints"
+        ],
+        "dimensions": {
+            "width": 870,
+            "height": 830
+        },
+        "date_created": "2024-11-17",
+        "author": "Jiwon Kim",
+        "license": "CC BY-SA 4.0"
+    },
+    "joint_coordinates": {}
+}
