@@ -1,73 +1,156 @@
+import cv2
+import mediapipe as mp
+import numpy as np
+import asyncio
+import openai
+from PIL import Image, ImageDraw, ImageFont
+import time
 import os
-from langchain_openai import ChatOpenAI  # 최신 LangChain OpenAI 패키지 사용
-from langchain.prompts import ChatPromptTemplate  # 올바른 경로
-from langchain.memory import ConversationBufferMemory  # 올바른 메모리 클래스 경로
-from langchain.chains import ConversationChain  # 대화 체인을 사용
 
-# ChatGPT API를 이용한 피드백 생성 클래스
-class SeniorFriendlyFitnessBot:
-    def __init__(self):
-        self.prompt = self.create_prompt()
-        self.model = self.setup_model()
+# OpenAI API 키 설정
+openai.api_key = os.getenv("OPENAI_API_KEY")
 
-    def setup_model(self):
-        openai_api_key = os.getenv("OPENAI_API_KEY")
-        if not openai_api_key:
-            raise ValueError("환경변수에 'OPENAI_API_KEY'가 설정되지 않았습니다.")
+# MediaPipe Pose 초기화
+mp_pose = mp.solutions.pose
+pose = mp_pose.Pose()
 
-        # ChatOpenAI 모델 설정
-        chat_model = ChatOpenAI(
-            model="gpt-3.5-turbo",  # 모델 이름을 안전하게 설정
-            openai_api_key=openai_api_key,
-            temperature=0.5
-        )
+# 상태 변수 초기화
+feedback_message = ""
+last_feedback_time = 0
+feedback_interval = 2  # 피드백 최소 간격(초)
+last_state = None  # 이전 상태(작게, 적당히, 크게)
+pending_feedback = None  # GPT 피드백 대기 상태
 
-        # ConversationBufferMemory로 메모리 설정
-        memory = ConversationBufferMemory()  # 간단하고 안정적인 메모리 클래스 사용
-        conversation = ConversationChain(  # 대화 체인으로 설정
-            llm=chat_model,
-            memory=memory
-        )
-        return conversation
+# 움직임 상태 변수
+last_angles = None  # 이전 프레임의 각도들
+no_movement_start_time = None  # 멈춤 시작 시간
+movement_threshold = 5  # 움직임 감지 임계값
+no_movement_threshold = 1  # 멈춘 상태를 판단하기 위한 시간(초)
 
-    def create_prompt(self):
-        template = """
-        너는 시니어 운동자세교정 서비스의 가상캐릭터 "미니"야.
-        운동의 전체 자세 점수가 입력되면 너의 기능을 적극적으로 활용해 텍스트 피드백을 제공해줘. 
-        어르신들이 정확하고 안전한 자세로 운동할 수 있도록 피드백을 제공하는 게 너의 목표야.
-        
-        피드백 예시:
-        1. 90점 이상: "정말 잘하고 계세요! 그대로 하시면 됩니다!"
-        2. 80점 이상 90점 미만: "좋습니다! 하지만 무릎이나 허리 각도를 살짝 조정해보시면 더 좋아질 거예요."
-        3. 80점 미만: "조금 위험할 수 있어요. 천천히 다시 해보시고 다치지 않게 조심하세요."
+# 어깨 회전 상태 기준
+ROTATION_RANGES = {
+    "작게": (0, 20),
+    "적당히": (20, 40),
+    "크게": (40, 90)
+}
 
-        주의사항:
-        1. 시험 성적이 아닌 어르신의 운동 자세가 얼마나 표준 자세와 일치하느냐의 정도를 점수로 표현한 거야. 그러니 공부와 관련된 표현을 쓰지마.
-        2. '어떤 방법으로 이렇게 좋은 점수를 받았나요?'과 유사한 내용의 질문은 하지마.
+# 한글 텍스트 표시 함수
+def put_korean_text(frame, text, position, font_path="malgun.ttf", font_size=20, color=(0, 255, 0)):
+    frame_pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(frame_pil)
+    font = ImageFont.truetype(font_path, font_size)
+    draw.text(position, text, font=font, fill=color)
+    return cv2.cvtColor(np.array(frame_pil), cv2.COLOR_RGB2BGR)
 
-        Human: {input}
-        미니:"""
+# 각도 계산 함수
+def calculate_angle(p1, p2, p3):
+    a = np.array(p1)
+    b = np.array(p2)
+    c = np.array(p3)
+    radians = np.arctan2(c[1] - b[1], c[0] - b[1]) - np.arctan2(a[1] - b[1], a[0] - b[1])
+    angle = np.abs(radians * 180.0 / np.pi)
+    return angle if angle <= 180.0 else 360 - angle
 
-        return ChatPromptTemplate.from_template(template)
+# 비동기 API 호출
+async def generate_feedback_from_api(prompt):
+    response = await openai.ChatCompletion.acreate(
+        model="gpt-4",
+        messages=[
+            {"role": "system", "content": "너는 어르신의 운동 자세를 교정해주는 가상캐릭터 '미니'야."},
+            {"role": "user", "content": prompt}
+        ]
+    )
+    return response['choices'][0]['message']['content'].strip()
 
-    def get_feedback(self, comparison_value: str):
-        # .predict()를 사용하여 대화 체인을 호출
-        return self.model.predict(input=comparison_value)
+# 자세 분석 함수
+def analyze_pose(landmarks):
+    global feedback_message, last_feedback_time, last_state, pending_feedback, last_angles, no_movement_start_time
 
-# 실행 코드
-if __name__ == "__main__":
-    bot = SeniorFriendlyFitnessBot()
+    # 양쪽 팔꿈치와 어깨의 각도 계산
+    left_elbow_angle = calculate_angle(
+        [landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].x, landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].y],
+        [landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value].x, landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value].y],
+        [landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value].x, landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value].y]
+    )
+    right_elbow_angle = calculate_angle(
+        [landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].x, landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y],
+        [landmarks[mp_pose.PoseLandmark.RIGHT_ELBOW.value].x, landmarks[mp_pose.PoseLandmark.RIGHT_ELBOW.value].y],
+        [landmarks[mp_pose.PoseLandmark.RIGHT_WRIST.value].x, landmarks[mp_pose.PoseLandmark.RIGHT_WRIST.value].y]
+    )
 
-    while True:
-        # 사용자로부터 자세 점수를 입력받음
-        similarity_score = input("운동 자세 점수를 입력하세요 (종료하려면 'quit' 입력): ")
-        if similarity_score.lower() == "quit":
+    # 평균 회전 각도 계산
+    avg_angle = (left_elbow_angle + right_elbow_angle) / 2
+
+    # 움직임 감지
+    if last_angles is not None:
+        if abs(avg_angle - last_angles) < movement_threshold:
+            if no_movement_start_time is None:
+                no_movement_start_time = time.time()
+            elif time.time() - no_movement_start_time > no_movement_threshold:
+                feedback_message = ""
+                return  # 멈춤 상태에서는 피드백 출력 안 함
+        else:
+            no_movement_start_time = None
+
+    last_angles = avg_angle
+
+    # 상태 감지
+    for state, (min_angle, max_angle) in ROTATION_RANGES.items():
+        if min_angle <= avg_angle <= max_angle:
+            current_state = state
             break
+    else:
+        current_state = "잘못된 자세"
 
-        try:
-            # 점수를 정수로 변환
-            score = int(similarity_score)
-            feedback = bot.get_feedback(f"자세 점수: {score}")
-            print("미니 >>", feedback)
-        except ValueError:
-            print("유효한 숫자 점수를 입력해주세요.")
+    # 상태 변화 시 피드백 제공
+    if current_state != last_state:
+        if current_state == "작게":
+            feedback_message = "어깨를 더 크게 회전하세요."
+        elif current_state == "적당히":
+            feedback_message = "좋습니다! 부드럽게 움직이고 있어요."
+        elif current_state == "크게":
+            feedback_message = "어깨를 더 작게 회전하세요."
+        elif current_state == "잘못된 자세":
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            feedback_message = loop.run_until_complete(
+                generate_feedback_from_api("사용자의 자세가 이상합니다. 교정 피드백을 간결하게 1줄로 제공해 주세요.")
+            )
+        last_state = current_state
+
+# 실시간 자세 분석
+cap = cv2.VideoCapture(0)
+nth_frame = 30  # 30번째 프레임마다 자세 분석
+frame_count = 0
+
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    # 화면 크기 조정
+    frame = cv2.resize(frame, (1280, 720))
+
+    frame_count += 1
+    if frame_count % nth_frame != 0:
+        frame = put_korean_text(frame, feedback_message, (50, 50), font_size=30, color=(0, 255, 0))
+        cv2.imshow('Exercise Feedback', frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+        continue
+
+    # MediaPipe로 자세 추적
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    result = pose.process(frame_rgb)
+
+    if result.pose_landmarks:
+        analyze_pose(result.pose_landmarks.landmark)
+
+    frame = put_korean_text(frame, feedback_message, (50, 50), font_size=30, color=(0, 255, 0))
+    cv2.imshow('Exercise Feedback', frame)
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
